@@ -19,10 +19,6 @@ A Python package for performing quantile regression using the PDLP solver from G
 ### Prerequisites
 - Python 3.6 or higher.
 - `ortools` package.
-### Install via pip
-```bash
-pip install quantile_regression_pdlp
-```
 ### Install from Source
 Clone the repository:
 ```bash
