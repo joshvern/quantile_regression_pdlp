@@ -233,8 +233,7 @@ class QuantileRegression:
 
         # Compute t-values and p-values
         coef_full = np.concatenate(([self.intercept_], self.coef_))
-        stderr_full = np.concatenate(([self.stderr_[0]], self.stderr_))
-        self.tvalues_ = coef_full / stderr_full
+        self.tvalues_ = coef_full / self.stderr_
 
-        df = len(y) - n_features
+        df = len(y) - (n_features - 1)
         self.pvalues_ = 2 * (1 - t.cdf(np.abs(self.tvalues_), df=df))
