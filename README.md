@@ -22,7 +22,7 @@ A Python package for performing quantile regression using the PDLP solver from G
 ### Install from Source
 Clone the repository:
 ```bash
-git clone https://github.com/{yourusername}/quantile_regression_pdlp.git
+git clone https://github.com/joshvern/quantile_regression_pdlp.git
 cd quantile_regression_pdlp
 pip install -U pip setuptools wheel
 pip install .
