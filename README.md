@@ -24,6 +24,7 @@ Clone the repository:
 ```bash
 git clone https://github.com/{yourusername}/quantile_regression_pdlp.git
 cd quantile_regression_pdlp
+pip install -U pip setuptools wheel
 pip install .
 ```
 ## Usage
