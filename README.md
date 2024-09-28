@@ -12,7 +12,7 @@ A Python package for performing quantile regression using the PDLP solver from G
     - [Class: `QuantileRegression`](#class-quantileregression)
 - [Examples](#examples)
     - [Example 1: Basic Usage](#example-1-basic-usage)
-    - [Example 2: Multiple Quantiles](#example-2-multiple-quantiles)
+    - [Example 2: Estimating Multiple Quantiles Simultaneously](#example-2-estimating-multiple-quantiles-simultaneously)
     - [Example 3: Weighted Quantile Regression with L1 Regularization](#example-3-weighted-quantile-regression-with-l1-regularization)
 - [Dependencies](#dependencies)
 - [Contributing](#contributing)
@@ -61,89 +61,99 @@ print('Predictions:', y_pred)
 
 ## Quantile Regression as a Linear Programming Problem
 
-Quantile regression aims to estimate the conditional quantiles of a response variable given certain predictor variables. Unlike ordinary least squares regression, which minimizes the sum of squared residuals, quantile regression minimizes a weighted sum of absolute residuals and can incorporate regularization.
+Quantile regression aims to estimate the conditional quantiles of a response variable given certain predictor variables. Unlike ordinary least squares regression, which minimizes the sum of squared residuals, quantile regression minimizes a weighted sum of absolute residuals and can incorporate regularization. Estimating multiple quantiles simultaneously allows for a more comprehensive understanding of the conditional distribution and ensures quantile estimates do not cross.
 
 ### Mathematical Formulation
 
-For a quantile $\tau \in (0, 1)$, the weighted quantile regression problem can be formulated as:
+For multiple quantiles $\tau_1 < \tau_2 < \dots < \tau_K$, the weighted quantile regression problem can be formulated as:
 
 $$
-\min_{\beta} \sum_{i=1}^{n} w_i \rho_{\tau}(y_i - x_i^{\top} \beta)
+\min_{\beta^{(k)}} \sum_{k=1}^{K} \sum_{i=1}^{n} w_i \rho_{\tau_k}(y_i - x_i^{\top} \beta^{(k)})
 $$
 
 where:
-
 - $y_i$ is the response variable.
 - $x_i$ is the vector of predictor variables.
-- $w_i$ is the weight assigned to the (i)th observation.
-- $\beta$ is the vector of coefficients.
-- $\rho_{\tau}(u)$ is the quantile loss function defined as:
+- $w_i$ is the weight assigned to the #th observation.
+- $\beta^{(k)}$ is the vector of coefficients for quantile $\tau_k$.
+- $\rho_{\tau_k}(u)$ is the quantile loss function defined as:
 
 $$
-\rho_{\tau}(u) = u(\tau - \mathbb{I}(u < 0))
+\rho_{\tau_k}(u) = u(\tau_k - \mathbb{I}(u < 0))
 $$
 
-This function is piecewise linear and convex, allowing the quantile regression problem to be expressed as a linear programming (LP) problem. Additionally, L1 regularization can be incorporated to promote sparsity in the coefficients.
+To prevent quantile crossing, we impose additional constraints ensuring that the predicted quantile levels are ordered appropriately:
+
+$$
+x_i^{\top} \beta^{(1)} \leq x_i^{\top} \beta^{(2)} \leq \dots \leq x_i^{\top} \beta^{(K)}, \quad \forall i = 1, \dots, n
+$$
 
 ### LP Formulation
 
 By introducing auxiliary variables and incorporating regularization, the problem can be rewritten:
 
-#### **Variables**
+#### Variables
 
-- Introduce non-negative slack variables $r_i^{+}$ and $r_i^{-}$ for each observation:
-
-$$
-y_i - x_i^{\top} \beta = r_i^{+} - r_i^{-}
-$$
-
-- For L1 regularization, introduce auxiliary variables $z_j$ for each coefficient $\beta_j$ (excluding the intercept):
+- For each quantile $\tau_k$, introduce:
+  - Coefficients $\beta^{(k)}$.
+  - Non-negative slack variables $r_{i}^{+(k)}$ and $r_{i}^{-(k)}$ for each observation:
 
 $$
-z_j \geq \beta_j \\
-z_j \geq -\beta_j
+y_i - x_i^{\top} \beta^{(k)} = r_{i}^{+(k)} - r_{i}^{-(k)}, \quad \forall i, \forall k
 $$
 
-#### **Objective Function**
-
-The objective function incorporates both the weighted quantile loss and the L1 regularization term:
+- For L1 regularization, introduce auxiliary variables $z_j^{(k)}$ for each coefficient $\beta_j^{(k)}$ (excluding the intercept):
 
 $$
-\min_{\beta, r^{+}, r^{-}, z} \sum_{i=1}^{n} (\tau w_i r_i^{+} + (1 - \tau) w_i r_i^{-}) + \lambda \sum_{j=1}^{p} z_j
+z_j^{(k)} \geq \beta_j^{(k)} \\
+z_j^{(k)} \geq -\beta_j^{(k)}, \quad \forall j, \forall k
+$$
+
+#### Objective Function
+
+The objective function incorporates both the weighted quantile loss for all quantiles and the L1 regularization term:
+
+$$
+\min_{\beta^{(k)}, r^{+(k)}, r^{-(k)}, z^{(k)}} \sum_{k=1}^{K} \left( \sum_{i=1}^{n} \left( \tau_k w_i r_{i}^{+(k)} + (1 - \tau_k) w_i r_{i}^{-(k)} \right) + \lambda \sum_{j=1}^{p} z_j^{(k)} \right)
 $$
 
 where:
-
 - $\lambda$ is the regularization strength parameter.
 - $p$ is the number of predictor variables (excluding the intercept).
 
-#### **Constraints**
+#### Constraints
 
 Subject to the constraints:
 
 1. **Residual Constraints**:
 
 $$
-y_i - x_i^{\top} \beta = r_i^{+} - r_i^{-}, \quad \forall i = 1, \dots, n
+y_i - x_i^{\top} \beta^{(k)} = r_{i}^{+(k)} - r_{i}^{-(k)}, \quad \forall i = 1, \dots, n; \quad \forall k = 1, \dots, K
 $$
 
 2. **Non-negativity Constraints**:
 
 $$
-r_i^{+} \geq 0, \quad r_i^{-} \geq 0, \quad \forall i = 1, \dots, n
+r_{i}^{+(k)} \geq 0, \quad r_{i}^{-(k)} \geq 0, \quad \forall i = 1, \dots, n; \quad \forall k = 1, \dots, K
 $$
 
 3. **L1 Regularization Constraints**:
 
 $$
-z_j \geq \beta_j, \quad \forall j = 1, \dots, p \\
-z_j \geq -\beta_j, \quad \forall j = 1, \dots, p
+z_j^{(k)} \geq \beta_j^{(k)}, \quad z_j^{(k)} \geq -\beta_j^{(k)}, \quad \forall j = 1, \dots, p; \quad \forall k = 1, \dots, K
+$$
+
+4. **Non-Crossing Constraints**:
+
+$$
+x_i^{\top} \beta^{(k)} \leq x_i^{\top} \beta^{(k+1)}, \quad \forall i = 1, \dots, n; \quad \forall k = 1, \dots, K-1
 $$
 
 This LP formulation can be efficiently solved using the PDLP solver provided by Google's OR-Tools.
 
 ## Features
 - **Custom Quantiles**: Supports estimation for any quantile $\tau \in (0, 1)$.
+- **Multiple Quantiles**: Estimates multiple quantiles simultaneously without crossing.
 - **Weighted Quantile Regression**: Assigns different weights to observations, allowing differential influence on regression estimates.
 - **L1 Regularization (Lasso)**: Promotes sparsity in the model by penalizing the absolute values of the coefficients.
 - **Statistical Summaries**: Provides standard errors, t-values, and p-values computed via bootstrapping.
@@ -158,18 +168,18 @@ This LP formulation can be efficiently solved using the PDLP solver provided by 
 QuantileRegression(tau=0.5, n_bootstrap=1000, random_state=None, regularization='none', alpha=0.0)
 ```
 - **Parameters**:
-    - `tau` (float, default=0.5): The quantile to estimate, must be between 0 and 1.
+    - `tau` (float or list of floats, default=0.5): The quantile(s) to estimate, each must be between 0 and 1. Can be a single float or a list of floats.
     - `n_bootstrap` (int, default=1000): Number of bootstrap samples for estimating standard errors.
     - `random_state` (int, default=None): Seed for the random number generator.
     - `regularization` (str, default='none'): Type of regularization to apply. Options are `'l1'` for Lasso regularization or `'none'` for no regularization.
     - `alpha` (float, default=0.0): Regularization strength. Must be a non-negative float. Higher values imply stronger regularization.
 
 *Attributes*
-- `coef_` (ndarray): Estimated coefficients for the regression model.
-- `intercept_` (float): Estimated intercept term.
-- `stderr_` (ndarray): Standard errors of the coefficients.
-- `tvalues_` (ndarray): T-statistics of the coefficients.
-- `pvalues_` (ndarray): P-values of the coefficients.
+- `coef_` (dict): Estimated coefficients for each quantile. Keys are quantile values, and values are arrays of coefficients.
+- `intercept_` (dict): Estimated intercept term for each quantile. Keys are quantile values, and values are floats.
+- `stderr_` (dict): Standard errors of the coefficients for each quantile. Keys are quantile values, and values are arrays of standard errors.
+- `tvalues_` (dict): T-statistics of the coefficients for each quantile. Keys are quantile values, and values are arrays of t-values.
+- `pvalues_` (dict): P-values of the coefficients for each quantile. Keys are quantile values, and values are arrays of p-values.
 
 *Methods*
 - `fit(X, y, weights=None)`: Fit the quantile regression model to the data.
@@ -182,10 +192,10 @@ QuantileRegression(tau=0.5, n_bootstrap=1000, random_state=None, regularization=
 - `predict(X)`: Predict using the quantile regression model.
     - **Parameters**:
         - `X`: array-like of shape (n_samples, n_features). Samples.
-    - **Returns**: `y_pred` (ndarray of shape (n_samples,))
+    - **Returns**: `y_pred` (dict of ndarrays)
 
 - `summary()`: Return a summary of the regression results.
-    - **Returns**: `summary_df` (pandas DataFrame)
+    - **Returns**: `summary_dict` (dict of pandas DataFrames)
 
 ## Examples
 ### Example 1: Basic Usage
@@ -201,7 +211,7 @@ y = np.random.rand(50) * 2 + np.random.randn(50) * 0.5
 #Model
 model = QuantileRegression(tau=0.5, n_bootstrap=500, random_state=0)
 model.fit(X, y)
-print(model.summary())
+print(model.summary()[0.5])
 ```
 **Output**
 ```
@@ -210,37 +220,55 @@ Intercept     1.000226    0.236704  4.225639  0.000103
 X1           -0.054309    0.545591 -0.099542  0.921114
 ```
 
-### Example 2: Multiple Quantiles
+### Example 2: Estimating Multiple Quantiles Simultaneously
 ```python
-quantiles = [0.25, 0.5, 0.75]
-models = {}
+from quantile_regression_pdlp import QuantileRegression
+import numpy as np
 
-for tau in quantiles:
-    model = QuantileRegression(tau=tau, n_bootstrap=500, random_state=42)
-    model.fit(X, y)
-    models[tau] = model
+# Data
+np.random.seed(0)
+X = np.random.rand(50, 1)
+y = np.random.rand(50) * 2 + np.random.randn(50) * 0.5
+
+# Model
+quantiles = [0.25, 0.5, 0.75]
+model = QuantileRegression(tau=quantiles, n_bootstrap=500, random_state=0)
+model.fit(X, y)
 
 # Accessing summaries
-for tau, model in models.items():
+summaries = model.summary()
+for tau, summary_df in summaries.items():
     print(f"\nQuantile: {tau}")
-    print(model.summary())
+    print(summary_df)
+
+# Making predictions
+X_new = np.array([[0.1], [0.5], [0.9]])
+predictions = model.predict(X_new)
+for tau, y_pred in predictions.items():
+    print(f"\nPredictions for quantile {tau}: {y_pred}")
 ```
 **Output**
 ```
 Quantile: 0.25
            Coefficient  Std. Error   t-value     P>|t|
-Intercept     0.989807    0.241534  4.097998  0.000156
-X1           -0.827227    0.350021 -2.363365  0.022121
+Intercept     0.989803    0.232086  4.264809  0.000091
+X1           -0.827212    0.359381 -2.301768  0.025639
 
 Quantile: 0.5
            Coefficient  Std. Error   t-value     P>|t|
-Intercept     1.000226    0.233869  4.276863  0.000087
-X1           -0.054309    0.531167 -0.102245  0.918979
+Intercept     1.000221    0.231796  4.315086  0.000077
+X1           -0.054280    0.531496 -0.102128  0.919072
 
 Quantile: 0.75
            Coefficient  Std. Error   t-value     P>|t|
-Intercept     1.612909    0.400987  4.022350  0.000199
-X1           -0.163155    0.691681 -0.235882  0.814507
+Intercept     1.612909    0.383085  4.210315  0.000109
+X1           -0.163154    0.670333 -0.243393  0.808717
+
+Predictions for quantile 0.25: [0.90708228 0.57619763 0.24531299]
+
+Predictions for quantile 0.5: [0.99479299 0.97308079 0.95136859]
+
+Predictions for quantile 0.75: [1.59659361 1.53133192 1.46607023]
 ```
 
 ### Example 3: Weighted Quantile Regression with L1 Regularization
@@ -256,9 +284,9 @@ y = 1.0 + 2.5 * X[:, 0] - 1.5 * X[:, 1] + 0.5 * X[:, 2] + np.random.randn(200) *
 #Assign weights: higher weights to observations with y > median
 weights = np.where(y > np.median(y), 1.5, 1.0)
 
-#Initialize and fit the model with L1 regularization
+#Initialize and fit the model with multiple quantiles and L1 regularization
 model = QuantileRegression(
-    tau=0.5,
+    tau=[0.25, 0.5, 0.75],  # Multiple quantiles
     n_bootstrap=500,
     random_state=42,
     regularization='l1',
@@ -266,26 +294,50 @@ model = QuantileRegression(
 )
 model.fit(X, y, weights=weights)
 
-#Print the summary
-print(model.summary())
+#Print the summaries for each quantile
+summaries = model.summary()
+for tau, summary_df in summaries.items():
+    print(f"\nQuantile: {tau}")
+    print(summary_df)
 
-#Make predictions
+#Make predictions for each quantile
 X_new = np.array([
     [0.2, 0.3, 0.5],
     [0.6, 0.8, 0.1],
     [0.4, 0.5, 0.9]
 ])
 y_pred = model.predict(X_new)
-print('Predictions:', y_pred)
+for tau, preds in y_pred.items():
+    print(f"\nPredictions for quantile {tau}: {preds}")
 ```
 **Output**
 ```
+Quantile: 0.25
+           Coefficient  Std. Error    t-value         P>|t|
+Intercept     0.810970    0.082416   9.839943  0.000000e+00
+X1            2.545751    0.099900  25.483014  0.000000e+00
+X2           -1.594534    0.086994 -18.329156  0.000000e+00
+X3            0.512027    0.087006   5.884950  1.687805e-08
+
+Quantile: 0.5
            Coefficient  Std. Error    t-value     P>|t|
-Intercept     1.055083    0.093393  11.297225  0.000000
-X1            2.494034    0.100485  24.819935  0.000000
-X2           -1.560294    0.106501 -14.650449  0.000000
-X3            0.428887    0.105701   4.057566  0.000071
-Predictions: [1.300245   1.34615695 1.65854778]
+Intercept     1.055079    0.093192  11.321600  0.000000
+X1            2.494038    0.100447  24.829305  0.000000
+X2           -1.560300    0.105679 -14.764491  0.000000
+X3            0.428890    0.105631   4.060266  0.000071
+
+Quantile: 0.75
+           Coefficient  Std. Error    t-value     P>|t|
+Intercept     1.224177    0.099520  12.300762  0.000000
+X1            2.515053    0.117779  21.354093  0.000000
+X2           -1.531661    0.120866 -12.672435  0.000000
+X3            0.439465    0.128081   3.431139  0.000732
+
+Predictions for quantile 0.25: [1.09777369 1.11399647 1.49282796]
+
+Predictions for quantile 0.5: [1.30024154 1.34615084 1.65854521]
+
+Predictions for quantile 0.75: [1.48742136 1.55182608 1.8598857 ]
 ```
 
 ## Dependencies

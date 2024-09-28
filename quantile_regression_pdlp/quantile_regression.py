@@ -13,8 +13,9 @@ class QuantileRegression:
 
     Parameters
     ----------
-    tau : float, default=0.5
-        The quantile to estimate, which must be between 0 and 1.
+    tau : float or list of floats, default=0.5
+        The quantile(s) to estimate, each must be between 0 and 1.
+        Can be a single float for one quantile or a list of floats for multiple quantiles.
 
     n_bootstrap : int, default=1000
         Number of bootstrap samples to use for estimating standard errors.
@@ -30,20 +31,20 @@ class QuantileRegression:
 
     Attributes
     ----------
-    coef_ : ndarray of shape (n_features,)
-        Estimated coefficients for the linear regression problem.
+    coef_ : dict
+        Estimated coefficients for each quantile. Keys are quantile values, and values are arrays of coefficients.
 
-    intercept_ : float
-        Independent term in the linear model.
+    intercept_ : dict
+        Estimated intercept term for each quantile. Keys are quantile values, and values are floats.
 
-    stderr_ : ndarray of shape (n_features + 1,)
-        Standard errors of the coefficients (including intercept).
+    stderr_ : dict
+        Standard errors of the coefficients for each quantile. Keys are quantile values, and values are arrays of standard errors.
 
-    tvalues_ : ndarray of shape (n_features + 1,)
-        T-statistics for the coefficients.
+    tvalues_ : dict
+        T-statistics of the coefficients for each quantile. Keys are quantile values, and values are arrays of t-values.
 
-    pvalues_ : ndarray of shape (n_features + 1,)
-        P-values for the coefficients.
+    pvalues_ : dict
+        P-values of the coefficients for each quantile. Keys are quantile values, and values are arrays of p-values.
 
     Methods
     -------
@@ -58,19 +59,29 @@ class QuantileRegression:
     """
 
     def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None, regularization='none', alpha=0.0):
-        if not 0 < tau < 1:
-            raise ValueError("The quantile tau must be between 0 and 1.")
-        self.tau = tau
+        if isinstance(tau, float):
+            if not 0 < tau < 1:
+                raise ValueError("Each quantile tau must be between 0 and 1.")
+            self.tau = [tau]
+        elif isinstance(tau, list):
+            if not all(isinstance(q, float) and 0 < q < 1 for q in tau):
+                raise ValueError("All quantiles tau must be floats between 0 and 1.")
+            self.tau = sorted(tau)  # Sort to enforce ordering
+        else:
+            raise TypeError("tau must be a float or a list of floats.")
+
         self.n_bootstrap = n_bootstrap
         self.random_state = random_state
-        self.regularization = regularization  # Added regularization parameter
-        self.alpha = alpha  # Added alpha parameter for regularization strength
-        self.coef_ = None
-        self.intercept_ = None
-        self.stderr_ = None
-        self.tvalues_ = None
-        self.pvalues_ = None
-        self._is_fitted = False
+        self.regularization = regularization
+        self.alpha = alpha
+
+        # Initialize attributes as dictionaries for multiple quantiles
+        self.coef_ = {q: None for q in self.tau}
+        self.intercept_ = {q: None for q in self.tau}
+        self.stderr_ = {q: None for q in self.tau}
+        self.tvalues_ = {q: None for q in self.tau}
+        self.pvalues_ = {q: None for q in self.tau}
+        self._is_fitted = {q: False for q in self.tau}
 
     def fit(self, X, y, weights=None):
         """
@@ -107,63 +118,33 @@ class QuantileRegression:
         # Add intercept term by appending a column of ones to X
         X_augmented = np.hstack((np.ones((n_samples, 1)), X))
 
-        # Solve the linear programming problem
-        beta_values = self._solve_lp(X_augmented, y, weights)  # Modified to include weights
+        # Initialize storage for multiple quantiles
+        self.coef_ = {q: np.zeros(n_features) for q in self.tau}
+        self.intercept_ = {q: 0.0 for q in self.tau}
+        self.stderr_ = {q: np.zeros(n_features + 1) for q in self.tau}
+        self.tvalues_ = {q: np.zeros(n_features + 1) for q in self.tau}
+        self.pvalues_ = {q: np.zeros(n_features + 1) for q in self.tau}
 
-        self.intercept_ = beta_values[0]
-        self.coef_ = beta_values[1:]
+        # Solve LP for all quantiles simultaneously with non-crossing constraints
+        coefficients = self._solve_multiple_lp(X_augmented, y, weights)
 
-        # Estimate standard errors via bootstrapping
-        self._compute_standard_errors(X_augmented, y, weights)  # Modified to include weights
+        # Extract the coefficients
+        for q in self.tau:
+            self.intercept_[q] = coefficients[q][0]
+            self.coef_[q] = coefficients[q][1:]
 
-        self._is_fitted = True
+        # Compute standard errors via bootstrapping
+        self._compute_standard_errors(X_augmented, y, weights)
+
+        # Mark all quantiles as fitted
+        for q in self.tau:
+            self._is_fitted[q] = True
+
         return self
 
-    def predict(self, X):
+    def _solve_multiple_lp(self, X, y, weights, return_coefficients=True):
         """
-        Predict using the quantile regression model.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Samples.
-
-        Returns
-        -------
-        y_pred : ndarray of shape (n_samples,)
-            Predicted values.
-        """
-        if not self._is_fitted:
-            raise Exception("Model is not fitted yet. Please call 'fit' before 'predict'.")
-
-        X = np.asarray(X)
-        return np.dot(X, self.coef_) + self.intercept_
-
-    def summary(self):
-        """
-        Return a summary of the regression results.
-
-        Returns
-        -------
-        summary_df : pandas DataFrame
-            Summary table with coefficients, standard errors, t-values, and p-values.
-        """
-        if not self._is_fitted:
-            raise Exception("Model is not fitted yet. Please call 'fit' before 'summary'.")
-
-        coef = np.concatenate(([self.intercept_], self.coef_))
-        index = ['Intercept'] + [f'X{i}' for i in range(1, len(self.coef_) + 1)]
-        summary_df = pd.DataFrame({
-            'Coefficient': coef,
-            'Std. Error': self.stderr_,
-            't-value': self.tvalues_,
-            'P>|t|': self.pvalues_,
-        }, index=index)
-        return summary_df
-
-    def _solve_lp(self, X, y, weights):
-        """
-        Solve the quantile regression problem formulated as a linear program.
+        Solve multiple quantile regression problems as a single LP with non-crossing constraints.
 
         Parameters
         ----------
@@ -176,12 +157,16 @@ class QuantileRegression:
         weights : ndarray of shape (n_samples,)
             Weights for each observation.
 
+        return_coefficients : bool, default=True
+            Whether to return the estimated coefficients.
+
         Returns
         -------
-        beta_values : ndarray of shape (n_features + 1,)
-            Estimated coefficients (including intercept).
+        coefficients : dict (only if return_coefficients is True)
+            Estimated coefficients for each quantile.
         """
         n_samples, n_features = X.shape
+        n_quantiles = len(self.tau)
 
         # Create the solver instance
         solver = pywraplp.Solver.CreateSolver('PDLP')
@@ -190,37 +175,51 @@ class QuantileRegression:
 
         infinity = solver.infinity()
 
-        # Define variables: coefficients and residuals
-        beta = [solver.NumVar(-infinity, infinity, f'beta_{j}') for j in range(n_features)]
-        r_pos = [solver.NumVar(0, infinity, f'r_pos_{i}') for i in range(n_samples)]
-        r_neg = [solver.NumVar(0, infinity, f'r_neg_{i}') for i in range(n_samples)]
+        # Define variables for each quantile
+        beta = {q: [solver.NumVar(-infinity, infinity, f'beta_{j}_q{q}') for j in range(n_features)] for q in self.tau}
+        r_pos = {q: [solver.NumVar(0, infinity, f'r_pos_{i}_q{q}') for i in range(n_samples)] for q in self.tau}
+        r_neg = {q: [solver.NumVar(0, infinity, f'r_neg_{i}_q{q}') for i in range(n_samples)] for q in self.tau}
 
-        # If L1 regularization is specified, introduce auxiliary variables
+        # If L1 regularization is specified, introduce auxiliary variables for each quantile and feature
         if self.regularization == 'l1' and self.alpha > 0:
-            z = [solver.NumVar(0, infinity, f'z_{j}') for j in range(1, n_features)]
-            for j in range(1, n_features):
-                # z_j >= beta_j
-                solver.Add(beta[j] <= z[j-1])
-                # z_j >= -beta_j
-                solver.Add(-beta[j] <= z[j-1])
+            z = {q: [solver.NumVar(0, infinity, f'z_{j}_q{q}') for j in range(1, n_features)] for q in self.tau}
+            for q in self.tau:
+                for j in range(1, n_features):
+                    # z_j_q >= beta_j_q
+                    solver.Add(beta[q][j] <= z[q][j - 1])
+                    # z_j_q >= -beta_j_q
+                    solver.Add(-beta[q][j] <= z[q][j - 1])
 
-        # Add constraints: y_i = x_i^T beta + r_pos_i - r_neg_i
-        for i in range(n_samples):
-            constraint_expr = sum(X[i, j] * beta[j] for j in range(n_features)) + r_pos[i] - r_neg[i]
-            solver.Add(constraint_expr == y[i])
-
-        # Define the objective function
+        # Add constraints and objective
         objective = solver.Objective()
-        for i in range(n_samples):
-            objective.SetCoefficient(r_pos[i], self.tau * weights[i])
-            objective.SetCoefficient(r_neg[i], (1 - self.tau) * weights[i])
+        for q in self.tau:
+            tau_index = self.tau.index(q)
+            for i in range(n_samples):
+                # Residual constraints: y_i = x_i^T beta_q + r_pos_q_i - r_neg_q_i
+                constraint_expr = sum(X[i, j] * beta[q][j] for j in range(n_features)) + r_pos[q][i] - r_neg[q][i]
+                solver.Add(constraint_expr == y[i])
+
+                # Objective coefficients
+                objective.SetCoefficient(r_pos[q][i], q * weights[i])
+                objective.SetCoefficient(r_neg[q][i], (1 - q) * weights[i])
 
         # Add L1 regularization to the objective if specified
         if self.regularization == 'l1' and self.alpha > 0:
-            for j in range(n_features - 1):
-                objective.SetCoefficient(z[j], self.alpha)
+            for q in self.tau:
+                for j in range(n_features - 1):
+                    objective.SetCoefficient(z[q][j], self.alpha)
 
         objective.SetMinimization()
+
+        # Add non-crossing constraints
+        for i in range(n_samples):
+            for k in range(n_quantiles - 1):
+                q_lower = self.tau[k]
+                q_upper = self.tau[k + 1]
+                # Predicted values for quantile q_lower <= predicted values for quantile q_upper
+                pred_lower = sum(X[i, j] * beta[q_lower][j] for j in range(n_features))
+                pred_upper = sum(X[i, j] * beta[q_upper][j] for j in range(n_features))
+                solver.Add(pred_lower <= pred_upper)
 
         # Solve the LP problem
         status = solver.Solve()
@@ -228,10 +227,14 @@ class QuantileRegression:
         if status != pywraplp.Solver.OPTIMAL:
             raise Exception('Solver did not find an optimal solution.')
 
-        # Extract the coefficients
-        beta_values = np.array([beta[j].solution_value() for j in range(n_features)])
-
-        return beta_values
+        if return_coefficients:
+            # Extract the coefficients
+            coefficients = {}
+            for q in self.tau:
+                intercept = beta[q][0].solution_value()
+                coef = np.array([beta[q][j].solution_value() for j in range(1, n_features)])
+                coefficients[q] = np.concatenate(([intercept], coef))
+            return coefficients
 
     def _compute_standard_errors(self, X, y, weights):
         """
@@ -251,7 +254,8 @@ class QuantileRegression:
         np.random.seed(self.random_state)
         n_samples = X.shape[0]
         n_features = X.shape[1]
-        beta_bootstrap = np.zeros((self.n_bootstrap, n_features))
+        n_quantiles = len(self.tau)
+        beta_bootstrap = {q: np.zeros((self.n_bootstrap, n_features)) for q in self.tau}
 
         for i in tqdm(range(self.n_bootstrap), desc='Bootstrapping'):
             sample_indices = np.random.choice(n_samples, n_samples, replace=True)
@@ -260,22 +264,86 @@ class QuantileRegression:
             weights_sample = weights[sample_indices]
 
             try:
-                beta_sample = self._solve_lp(X_sample, y_sample, weights_sample)
-                beta_bootstrap[i, :] = beta_sample
+                # Solve for multiple quantiles
+                beta_sample = self._solve_multiple_lp(X_sample, y_sample, weights_sample, return_coefficients=True)
+                for q in self.tau:
+                    beta_bootstrap[q][i, :] = beta_sample[q]
             except Exception:
-                beta_bootstrap[i, :] = np.nan
+                for q in self.tau:
+                    beta_bootstrap[q][i, :] = np.nan
 
-        # Remove any iterations where the solver failed
-        valid_bootstrap = beta_bootstrap[~np.isnan(beta_bootstrap).any(axis=1)]
+        # Compute standard errors, t-values, and p-values for each quantile
+        for q in self.tau:
+            # Remove any iterations where the solver failed
+            valid_bootstrap = beta_bootstrap[q][~np.isnan(beta_bootstrap[q]).any(axis=1)]
 
-        # Compute standard errors
-        stderr = np.std(valid_bootstrap, axis=0, ddof=1)
-        self.stderr_ = stderr
+            if valid_bootstrap.size == 0:
+                raise Exception(f"All bootstrap iterations failed for quantile {q}.")
 
-        # Compute t-values and p-values
-        coef_full = np.concatenate(([self.intercept_], self.coef_))
-        stderr_full = self.stderr_
-        self.tvalues_ = coef_full / stderr_full
+            # Compute standard errors
+            stderr = np.std(valid_bootstrap, axis=0, ddof=1)
+            self.stderr_[q] = stderr
 
-        df = len(y) - (n_features - 1)  # Degrees of freedom
-        self.pvalues_ = 2 * (1 - t.cdf(np.abs(self.tvalues_), df=df))
+            # Compute t-values and p-values
+            coef_full = np.concatenate(([self.intercept_[q]], self.coef_[q]))
+            stderr_full = self.stderr_[q]
+            tvalues_full = coef_full / stderr_full
+            self.tvalues_[q] = tvalues_full
+
+            df = len(y) - (n_features - 1)  # Degrees of freedom
+            pvalues_full = 2 * (1 - t.cdf(np.abs(tvalues_full), df=df))
+            self.pvalues_[q] = pvalues_full
+
+    def predict(self, X):
+        """
+        Predict using the quantile regression model.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Samples.
+
+        Returns
+        -------
+        y_pred : dict of ndarrays
+            Predicted values for each quantile. Keys are quantile values, and values are arrays of predictions.
+        """
+        if not all(self._is_fitted.values()):
+            raise Exception("Model is not fitted yet. Please call 'fit' before 'predict'.")
+
+        X = np.asarray(X)
+        n_samples = X.shape[0]
+
+        # Add intercept term
+        X_augmented = np.hstack((np.ones((n_samples, 1)), X))
+
+        y_pred = {}
+        for q in self.tau:
+            y_pred[q] = X_augmented @ np.concatenate(([self.intercept_[q]], self.coef_[q]))
+        return y_pred
+
+    def summary(self):
+        """
+        Return a summary of the regression results.
+
+        Returns
+        -------
+        summary_df : dict of pandas DataFrames
+            Summary tables for each quantile with coefficients, standard errors, t-values, and p-values.
+        """
+        if not all(self._is_fitted.values()):
+            raise Exception("Model is not fitted yet. Please call 'fit' before 'summary'.")
+
+        summary_dict = {}
+        for q in self.tau:
+            coef = np.concatenate(([self.intercept_[q]], self.coef_[q]))
+            index = ['Intercept'] + [f'X{i}' for i in range(1, len(self.coef_[q]) + 1)]
+            summary_df = pd.DataFrame({
+                'Coefficient': coef,
+                'Std. Error': self.stderr_[q],
+                't-value': self.tvalues_[q],
+                'P>|t|': self.pvalues_[q],
+            }, index=index)
+            summary_dict[q] = summary_df
+
+        return summary_dict
