@@ -22,6 +22,12 @@ class QuantileRegression:
     random_state : int, default=None
         Seed for the random number generator.
 
+    regularization : str, default='none'
+        Type of regularization to apply. Options are 'l1' for Lasso regularization or 'none' for no regularization.
+
+    alpha : float, default=0.0
+        Regularization strength. Must be a non-negative float. Higher values imply stronger regularization.
+
     Attributes
     ----------
     coef_ : ndarray of shape (n_features,)
@@ -41,7 +47,7 @@ class QuantileRegression:
 
     Methods
     -------
-    fit(X, y)
+    fit(X, y, weights=None)
         Fit the quantile regression model.
 
     predict(X)
@@ -51,12 +57,14 @@ class QuantileRegression:
         Return a summary of the regression results.
     """
 
-    def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None):
+    def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None, regularization='none', alpha=0.0):
         if not 0 < tau < 1:
             raise ValueError("The quantile tau must be between 0 and 1.")
         self.tau = tau
         self.n_bootstrap = n_bootstrap
         self.random_state = random_state
+        self.regularization = regularization  # Added regularization parameter
+        self.alpha = alpha  # Added alpha parameter for regularization strength
         self.coef_ = None
         self.intercept_ = None
         self.stderr_ = None
@@ -64,7 +72,7 @@ class QuantileRegression:
         self.pvalues_ = None
         self._is_fitted = False
 
-    def fit(self, X, y):
+    def fit(self, X, y, weights=None):
         """
         Fit the quantile regression model.
 
@@ -76,6 +84,9 @@ class QuantileRegression:
         y : array-like of shape (n_samples,)
             Target values.
 
+        weights : array-like of shape (n_samples,), optional
+            Weights for each observation. Default is None, which assigns equal weight to all observations.
+
         Returns
         -------
         self : object
@@ -83,19 +94,27 @@ class QuantileRegression:
         """
         X = np.asarray(X)
         y = np.asarray(y).flatten()
+
+        if weights is None:
+            weights = np.ones_like(y)
+        else:
+            weights = np.asarray(weights)
+            if weights.shape[0] != y.shape[0]:
+                raise ValueError("Weights array must have the same length as the number of observations.")
+
         n_samples, n_features = X.shape
 
         # Add intercept term by appending a column of ones to X
         X_augmented = np.hstack((np.ones((n_samples, 1)), X))
 
         # Solve the linear programming problem
-        beta_values = self._solve_lp(X_augmented, y)
+        beta_values = self._solve_lp(X_augmented, y, weights)  # Modified to include weights
 
         self.intercept_ = beta_values[0]
         self.coef_ = beta_values[1:]
 
         # Estimate standard errors via bootstrapping
-        self._compute_standard_errors(X_augmented, y)
+        self._compute_standard_errors(X_augmented, y, weights)  # Modified to include weights
 
         self._is_fitted = True
         return self
@@ -142,7 +161,7 @@ class QuantileRegression:
         }, index=index)
         return summary_df
 
-    def _solve_lp(self, X, y):
+    def _solve_lp(self, X, y, weights):
         """
         Solve the quantile regression problem formulated as a linear program.
 
@@ -153,6 +172,9 @@ class QuantileRegression:
 
         y : ndarray of shape (n_samples,)
             Target values.
+
+        weights : ndarray of shape (n_samples,)
+            Weights for each observation.
 
         Returns
         -------
@@ -173,17 +195,31 @@ class QuantileRegression:
         r_pos = [solver.NumVar(0, infinity, f'r_pos_{i}') for i in range(n_samples)]
         r_neg = [solver.NumVar(0, infinity, f'r_neg_{i}') for i in range(n_samples)]
 
+        # If L1 regularization is specified, introduce auxiliary variables
+        if self.regularization == 'l1' and self.alpha > 0:
+            z = [solver.NumVar(0, infinity, f'z_{j}') for j in range(1, n_features)]
+            for j in range(1, n_features):
+                # z_j >= beta_j
+                solver.Add(beta[j] <= z[j-1])
+                # z_j >= -beta_j
+                solver.Add(-beta[j] <= z[j-1])
+
         # Add constraints: y_i = x_i^T beta + r_pos_i - r_neg_i
         for i in range(n_samples):
-            xi = X[i]
-            constraint_expr = sum(xi[j] * beta[j] for j in range(n_features)) + r_pos[i] - r_neg[i]
+            constraint_expr = sum(X[i, j] * beta[j] for j in range(n_features)) + r_pos[i] - r_neg[i]
             solver.Add(constraint_expr == y[i])
 
         # Define the objective function
         objective = solver.Objective()
         for i in range(n_samples):
-            objective.SetCoefficient(r_pos[i], self.tau)
-            objective.SetCoefficient(r_neg[i], 1 - self.tau)
+            objective.SetCoefficient(r_pos[i], self.tau * weights[i])
+            objective.SetCoefficient(r_neg[i], (1 - self.tau) * weights[i])
+
+        # Add L1 regularization to the objective if specified
+        if self.regularization == 'l1' and self.alpha > 0:
+            for j in range(n_features - 1):
+                objective.SetCoefficient(z[j], self.alpha)
+
         objective.SetMinimization()
 
         # Solve the LP problem
@@ -194,9 +230,10 @@ class QuantileRegression:
 
         # Extract the coefficients
         beta_values = np.array([beta[j].solution_value() for j in range(n_features)])
+
         return beta_values
 
-    def _compute_standard_errors(self, X, y):
+    def _compute_standard_errors(self, X, y, weights):
         """
         Compute standard errors via bootstrapping.
 
@@ -207,6 +244,9 @@ class QuantileRegression:
 
         y : ndarray of shape (n_samples,)
             Target values.
+
+        weights : ndarray of shape (n_samples,)
+            Weights for each observation.
         """
         np.random.seed(self.random_state)
         n_samples = X.shape[0]
@@ -217,9 +257,10 @@ class QuantileRegression:
             sample_indices = np.random.choice(n_samples, n_samples, replace=True)
             X_sample = X[sample_indices]
             y_sample = y[sample_indices]
+            weights_sample = weights[sample_indices]
 
             try:
-                beta_sample = self._solve_lp(X_sample, y_sample)
+                beta_sample = self._solve_lp(X_sample, y_sample, weights_sample)
                 beta_bootstrap[i, :] = beta_sample
             except Exception:
                 beta_bootstrap[i, :] = np.nan
@@ -233,7 +274,8 @@ class QuantileRegression:
 
         # Compute t-values and p-values
         coef_full = np.concatenate(([self.intercept_], self.coef_))
-        self.tvalues_ = coef_full / self.stderr_
+        stderr_full = self.stderr_
+        self.tvalues_ = coef_full / stderr_full
 
-        df = len(y) - (n_features - 1)
+        df = len(y) - (n_features - 1)  # Degrees of freedom
         self.pvalues_ = 2 * (1 - t.cdf(np.abs(self.tvalues_), df=df))
