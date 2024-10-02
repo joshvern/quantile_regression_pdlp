@@ -5,9 +5,10 @@ import numpy as np
 import pandas as pd
 from scipy.stats import t
 from tqdm import tqdm
+from sklearn.base import BaseEstimator, RegressorMixin
 
 
-class QuantileRegression:
+class QuantileRegression(BaseEstimator, RegressorMixin):
     """
     Quantile Regression using PDLP solver from Google's OR-Tools, with statistical summaries.
 
@@ -46,6 +47,9 @@ class QuantileRegression:
     pvalues_ : dict
         P-values of the coefficients for each quantile. Keys are quantile values, and values are arrays of p-values.
 
+    feature_names_ : list
+        List of feature names. If input X is a pandas DataFrame, the column names are used; otherwise, generic names are assigned.
+
     Methods
     -------
     fit(X, y, weights=None)
@@ -59,29 +63,20 @@ class QuantileRegression:
     """
 
     def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None, regularization='none', alpha=0.0):
-        if isinstance(tau, float):
-            if not 0 < tau < 1:
-                raise ValueError("Each quantile tau must be between 0 and 1.")
-            self.tau = [tau]
-        elif isinstance(tau, list):
-            if not all(isinstance(q, float) and 0 < q < 1 for q in tau):
-                raise ValueError("All quantiles tau must be floats between 0 and 1.")
-            self.tau = sorted(tau)  # Sort to enforce ordering
-        else:
-            raise TypeError("tau must be a float or a list of floats.")
-
+        self.tau = tau
         self.n_bootstrap = n_bootstrap
         self.random_state = random_state
         self.regularization = regularization
         self.alpha = alpha
 
-        # Initialize attributes as dictionaries for multiple quantiles
-        self.coef_ = {q: None for q in self.tau}
-        self.intercept_ = {q: None for q in self.tau}
-        self.stderr_ = {q: None for q in self.tau}
-        self.tvalues_ = {q: None for q in self.tau}
-        self.pvalues_ = {q: None for q in self.tau}
-        self._is_fitted = {q: False for q in self.tau}
+        # Attributes initialized during fitting
+        self.coef_ = None
+        self.intercept_ = None
+        self.stderr_ = None
+        self.tvalues_ = None
+        self.pvalues_ = None
+        self.feature_names_ = None
+        self._is_fitted = None
 
     def fit(self, X, y, weights=None):
         """
@@ -90,10 +85,10 @@ class QuantileRegression:
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
-            Training data.
+            Training data. Can be a NumPy array or a pandas DataFrame.
 
         y : array-like of shape (n_samples,)
-            Target values.
+            Target values. Can be a NumPy array or a pandas Series.
 
         weights : array-like of shape (n_samples,), optional
             Weights for each observation. Default is None, which assigns equal weight to all observations.
@@ -103,8 +98,18 @@ class QuantileRegression:
         self : object
             Returns self.
         """
-        X = np.asarray(X)
-        y = np.asarray(y).flatten()
+        # Handle pandas DataFrames and Series
+        if isinstance(X, pd.DataFrame):
+            self.feature_names_ = X.columns.tolist()
+            X = X.values
+        else:
+            self.feature_names_ = [f'X{i}' for i in range(1, X.shape[1] + 1)]
+            X = np.asarray(X)
+
+        if isinstance(y, pd.Series):
+            y = y.values
+        else:
+            y = np.asarray(y).flatten()
 
         if weights is None:
             weights = np.ones_like(y)
@@ -112,6 +117,9 @@ class QuantileRegression:
             weights = np.asarray(weights)
             if weights.shape[0] != y.shape[0]:
                 raise ValueError("Weights array must have the same length as the number of observations.")
+
+        # Validate tau in __init__
+        self._validate_tau()
 
         n_samples, n_features = X.shape
 
@@ -124,6 +132,7 @@ class QuantileRegression:
         self.stderr_ = {q: np.zeros(n_features + 1) for q in self.tau}
         self.tvalues_ = {q: np.zeros(n_features + 1) for q in self.tau}
         self.pvalues_ = {q: np.zeros(n_features + 1) for q in self.tau}
+        self._is_fitted = {q: False for q in self.tau}
 
         # Solve LP for all quantiles simultaneously with non-crossing constraints
         coefficients = self._solve_multiple_lp(X_augmented, y, weights)
@@ -141,6 +150,25 @@ class QuantileRegression:
             self._is_fitted[q] = True
 
         return self
+
+    def _validate_tau(self):
+        """
+        Validate the tau parameter to ensure all quantiles are between 0 and 1 and properly sorted.
+
+        Raises
+        ------
+        ValueError, TypeError
+        """
+        if isinstance(self.tau, float):
+            if not 0 < self.tau < 1:
+                raise ValueError("Each quantile tau must be between 0 and 1.")
+            self.tau = [self.tau]
+        elif isinstance(self.tau, list):
+            if not all(isinstance(q, float) and 0 < q < 1 for q in self.tau):
+                raise ValueError("All quantiles tau must be floats between 0 and 1.")
+            self.tau = sorted(self.tau)  # Sort to enforce ordering
+        else:
+            raise TypeError("tau must be a float or a list of floats.")
 
     def _solve_multiple_lp(self, X, y, weights, return_coefficients=True):
         """
@@ -193,7 +221,6 @@ class QuantileRegression:
         # Add constraints and objective
         objective = solver.Objective()
         for q in self.tau:
-            tau_index = self.tau.index(q)
             for i in range(n_samples):
                 # Residual constraints: y_i = x_i^T beta_q + r_pos_q_i - r_neg_q_i
                 constraint_expr = sum(X[i, j] * beta[q][j] for j in range(n_features)) + r_pos[q][i] - r_neg[q][i]
@@ -290,7 +317,7 @@ class QuantileRegression:
             tvalues_full = coef_full / stderr_full
             self.tvalues_[q] = tvalues_full
 
-            df = len(y) - (n_features - 1)  # Degrees of freedom
+            df = len(y) - (X.shape[1] - 1)  # Degrees of freedom
             pvalues_full = 2 * (1 - t.cdf(np.abs(tvalues_full), df=df))
             self.pvalues_[q] = pvalues_full
 
@@ -301,7 +328,7 @@ class QuantileRegression:
         Parameters
         ----------
         X : array-like of shape (n_samples, n_features)
-            Samples.
+            Samples. Can be a NumPy array or a pandas DataFrame.
 
         Returns
         -------
@@ -311,7 +338,12 @@ class QuantileRegression:
         if not all(self._is_fitted.values()):
             raise Exception("Model is not fitted yet. Please call 'fit' before 'predict'.")
 
-        X = np.asarray(X)
+        # Handle pandas DataFrames
+        if isinstance(X, pd.DataFrame):
+            X = X.values
+        else:
+            X = np.asarray(X)
+
         n_samples = X.shape[0]
 
         # Add intercept term
@@ -328,7 +360,7 @@ class QuantileRegression:
 
         Returns
         -------
-        summary_df : dict of pandas DataFrames
+        summary_dict : dict of pandas DataFrames
             Summary tables for each quantile with coefficients, standard errors, t-values, and p-values.
         """
         if not all(self._is_fitted.values()):
@@ -337,7 +369,7 @@ class QuantileRegression:
         summary_dict = {}
         for q in self.tau:
             coef = np.concatenate(([self.intercept_[q]], self.coef_[q]))
-            index = ['Intercept'] + [f'X{i}' for i in range(1, len(self.coef_[q]) + 1)]
+            index = ['Intercept'] + self.feature_names_
             summary_df = pd.DataFrame({
                 'Coefficient': coef,
                 'Std. Error': self.stderr_[q],
@@ -347,3 +379,43 @@ class QuantileRegression:
             summary_dict[q] = summary_df
 
         return summary_dict
+
+    def get_params(self, deep=True):
+        """
+        Get parameters for this estimator.
+
+        Parameters
+        ----------
+        deep : bool, default=True
+            If True, will return the parameters for this estimator and contained subobjects that are estimators.
+
+        Returns
+        -------
+        params : dict
+            Parameter names mapped to their values.
+        """
+        return {
+            'tau': self.tau,
+            'n_bootstrap': self.n_bootstrap,
+            'random_state': self.random_state,
+            'regularization': self.regularization,
+            'alpha': self.alpha,
+        }
+
+    def set_params(self, **params):
+        """
+        Set the parameters of this estimator.
+
+        Parameters
+        ----------
+        **params : dict
+            Estimator parameters.
+
+        Returns
+        -------
+        self : object
+            Returns self.
+        """
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
