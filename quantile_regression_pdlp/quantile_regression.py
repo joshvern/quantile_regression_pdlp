@@ -6,6 +6,8 @@ import pandas as pd
 from scipy.stats import t
 from tqdm import tqdm
 from sklearn.base import BaseEstimator, RegressorMixin
+from joblib import Parallel, delayed
+import multiprocessing
 
 
 class QuantileRegression(BaseEstimator, RegressorMixin):
@@ -29,6 +31,10 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
 
     alpha : float, default=0.0
         Regularization strength. Must be a non-negative float. Higher values imply stronger regularization.
+
+    n_jobs : int, default=1
+        The number of jobs to run in parallel for bootstrapping.
+        `-1` means using all processors.
 
     Attributes
     ----------
@@ -62,12 +68,13 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         Return a summary of the regression results.
     """
 
-    def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None, regularization='none', alpha=0.0):
+    def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None, regularization='none', alpha=0.0, n_jobs=1):
         self.tau = tau
         self.n_bootstrap = n_bootstrap
         self.random_state = random_state
         self.regularization = regularization
         self.alpha = alpha
+        self.n_jobs = n_jobs
 
         # Attributes initialized during fitting
         self.coef_ = None
@@ -265,7 +272,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
 
     def _compute_standard_errors(self, X, y, weights):
         """
-        Compute standard errors via bootstrapping.
+        Compute standard errors via bootstrapping using parallel processing.
 
         Parameters
         ----------
@@ -282,9 +289,30 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         n_samples = X.shape[0]
         n_features = X.shape[1]
         n_quantiles = len(self.tau)
+
+        # Initialize storage for bootstrap coefficients
         beta_bootstrap = {q: np.zeros((self.n_bootstrap, n_features)) for q in self.tau}
 
-        for i in tqdm(range(self.n_bootstrap), desc='Bootstrapping'):
+        # Determine the number of jobs
+        if self.n_jobs == -1:
+            n_jobs = multiprocessing.cpu_count()
+        else:
+            n_jobs = self.n_jobs
+
+        def bootstrap_iteration(i):
+            """
+            Perform a single bootstrap iteration.
+
+            Parameters
+            ----------
+            i : int
+                Bootstrap iteration index.
+
+            Returns
+            -------
+            dict
+                Estimated coefficients for each quantile.
+            """
             sample_indices = np.random.choice(n_samples, n_samples, replace=True)
             X_sample = X[sample_indices]
             y_sample = y[sample_indices]
@@ -293,11 +321,20 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
             try:
                 # Solve for multiple quantiles
                 beta_sample = self._solve_multiple_lp(X_sample, y_sample, weights_sample, return_coefficients=True)
-                for q in self.tau:
-                    beta_bootstrap[q][i, :] = beta_sample[q]
+                return beta_sample
             except Exception:
-                for q in self.tau:
-                    beta_bootstrap[q][i, :] = np.nan
+                # Return NaNs if the solver fails
+                return {q: np.full(n_features, np.nan) for q in self.tau}
+
+        # Perform bootstrapping in parallel
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(bootstrap_iteration)(i) for i in range(self.n_bootstrap)
+        )
+
+        # Populate bootstrap coefficients
+        for i, beta_sample in enumerate(results):
+            for q in self.tau:
+                beta_bootstrap[q][i, :] = beta_sample[q]
 
         # Compute standard errors, t-values, and p-values for each quantile
         for q in self.tau:
@@ -400,6 +437,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
             'random_state': self.random_state,
             'regularization': self.regularization,
             'alpha': self.alpha,
+            'n_jobs': self.n_jobs,
         }
 
     def set_params(self, **params):
