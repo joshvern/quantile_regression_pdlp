@@ -8,6 +8,7 @@ from tqdm import tqdm
 from sklearn.base import BaseEstimator, RegressorMixin
 from joblib import Parallel, delayed
 import multiprocessing
+import threading
 
 
 class QuantileRegression(BaseEstimator, RegressorMixin):
@@ -68,7 +69,8 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         Return a summary of the regression results.
     """
 
-    def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None, regularization='none', alpha=0.0, n_jobs=1):
+    def __init__(self, tau=0.5, n_bootstrap=1000, random_state=None,
+                 regularization='none', alpha=0.0, n_jobs=1):
         self.tau = tau
         self.n_bootstrap = n_bootstrap
         self.random_state = random_state
@@ -149,7 +151,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
             self.intercept_[q] = coefficients[q][0]
             self.coef_[q] = coefficients[q][1:]
 
-        # Compute standard errors via bootstrapping
+        # Compute standard errors via bootstrapping with progress indicators
         self._compute_standard_errors(X_augmented, y, weights)
 
         # Mark all quantiles as fitted
@@ -272,7 +274,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
 
     def _compute_standard_errors(self, X, y, weights):
         """
-        Compute standard errors via bootstrapping using parallel processing.
+        Compute standard errors via bootstrapping using parallel processing with progress indicators.
 
         Parameters
         ----------
@@ -299,37 +301,55 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         else:
             n_jobs = self.n_jobs
 
-        def bootstrap_iteration(i):
-            """
-            Perform a single bootstrap iteration.
+        # Create a shared counter using multiprocessing.Manager
+        manager = multiprocessing.Manager()
+        counter = manager.Value('i', 0)
 
-            Parameters
-            ----------
-            i : int
-                Bootstrap iteration index.
+        # Define a lock for thread-safe counter updates
+        lock = manager.Lock()
 
-            Returns
-            -------
-            dict
-                Estimated coefficients for each quantile.
-            """
+        # Function to perform a single bootstrap iteration
+        def bootstrap_task(i):
             sample_indices = np.random.choice(n_samples, n_samples, replace=True)
             X_sample = X[sample_indices]
             y_sample = y[sample_indices]
             weights_sample = weights[sample_indices]
-
             try:
                 # Solve for multiple quantiles
                 beta_sample = self._solve_multiple_lp(X_sample, y_sample, weights_sample, return_coefficients=True)
+                with lock:
+                    counter.value += 1
                 return beta_sample
             except Exception:
-                # Return NaNs if the solver fails
+                with lock:
+                    counter.value += 1
                 return {q: np.full(n_features, np.nan) for q in self.tau}
+
+        # Function to update the progress bar
+        def update_pbar():
+            with tqdm(total=self.n_bootstrap, desc='Bootstrapping') as pbar:
+                previous = 0
+                while True:
+                    with lock:
+                        current = counter.value
+                    delta = current - previous
+                    if delta > 0:
+                        pbar.update(delta)
+                        previous = current
+                    if current >= self.n_bootstrap:
+                        break
+
+        # Start the progress bar updater thread
+        thread = threading.Thread(target=update_pbar)
+        thread.start()
 
         # Perform bootstrapping in parallel
         results = Parallel(n_jobs=n_jobs)(
-            delayed(bootstrap_iteration)(i) for i in range(self.n_bootstrap)
+            delayed(bootstrap_task)(i) for i in range(self.n_bootstrap)
         )
+
+        # Wait for the progress bar updater to finish
+        thread.join()
 
         # Populate bootstrap coefficients
         for i, beta_sample in enumerate(results):
