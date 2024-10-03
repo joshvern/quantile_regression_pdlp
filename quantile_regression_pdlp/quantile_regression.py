@@ -13,7 +13,7 @@ import threading
 
 class QuantileRegression(BaseEstimator, RegressorMixin):
     """
-    Quantile Regression using PDLP solver from Google's OR-Tools, with statistical summaries.
+    Quantile Regression using PDLP solver from Google's OR-Tools, with statistical summaries and multi-output support.
 
     Parameters
     ----------
@@ -40,22 +40,30 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
     Attributes
     ----------
     coef_ : dict
-        Estimated coefficients for each quantile. Keys are quantile values, and values are arrays of coefficients.
+        Estimated coefficients for each quantile and output.
+        Structure: {tau: {output: array of coefficients}}
 
     intercept_ : dict
-        Estimated intercept term for each quantile. Keys are quantile values, and values are floats.
+        Estimated intercept term for each quantile and output.
+        Structure: {tau: {output: float}}
 
     stderr_ : dict
-        Standard errors of the coefficients for each quantile. Keys are quantile values, and values are arrays of standard errors.
+        Standard errors of the coefficients for each quantile and output.
+        Structure: {tau: {output: array of standard errors}}
 
     tvalues_ : dict
-        T-statistics of the coefficients for each quantile. Keys are quantile values, and values are arrays of t-values.
+        T-statistics of the coefficients for each quantile and output.
+        Structure: {tau: {output: array of t-values}}
 
     pvalues_ : dict
-        P-values of the coefficients for each quantile. Keys are quantile values, and values are arrays of p-values.
+        P-values of the coefficients for each quantile and output.
+        Structure: {tau: {output: array of p-values}}
 
     feature_names_ : list
         List of feature names. If input X is a pandas DataFrame, the column names are used; otherwise, generic names are assigned.
+
+    output_names_ : list
+        List of output names. If input y is a pandas DataFrame, the column names are used; otherwise, generic names are assigned.
 
     Methods
     -------
@@ -85,6 +93,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         self.tvalues_ = None
         self.pvalues_ = None
         self.feature_names_ = None
+        self.output_names_ = None
         self._is_fitted = None
 
     def fit(self, X, y, weights=None):
@@ -96,8 +105,8 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         X : array-like of shape (n_samples, n_features)
             Training data. Can be a NumPy array or a pandas DataFrame.
 
-        y : array-like of shape (n_samples,)
-            Target values. Can be a NumPy array or a pandas Series.
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            Target values. Can be a NumPy array, pandas Series, or pandas DataFrame.
 
         weights : array-like of shape (n_samples,), optional
             Weights for each observation. Default is None, which assigns equal weight to all observations.
@@ -107,7 +116,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         self : object
             Returns self.
         """
-        # Handle pandas DataFrames and Series
+        # Handle pandas DataFrames and Series for X
         if isinstance(X, pd.DataFrame):
             self.feature_names_ = X.columns.tolist()
             X = X.values
@@ -115,48 +124,64 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
             self.feature_names_ = [f'X{i}' for i in range(1, X.shape[1] + 1)]
             X = np.asarray(X)
 
-        if isinstance(y, pd.Series):
+        # Handle pandas DataFrames, Series, or NumPy arrays for y
+        if isinstance(y, pd.DataFrame):
+            self.output_names_ = y.columns.tolist()
             y = y.values
+        elif isinstance(y, pd.Series):
+            self.output_names_ = [y.name if y.name is not None else 'y']
+            y = y.values.reshape(-1, 1)
         else:
-            y = np.asarray(y).flatten()
-
-        if weights is None:
-            weights = np.ones_like(y)
-        else:
-            weights = np.asarray(weights)
-            if weights.shape[0] != y.shape[0]:
-                raise ValueError("Weights array must have the same length as the number of observations.")
-
-        # Validate tau in __init__
-        self._validate_tau()
+            y = np.asarray(y)
+            if y.ndim == 1:
+                self.output_names_ = ['y']
+                y = y.reshape(-1, 1)
+            elif y.ndim == 2:
+                self.output_names_ = [f'y{i}' for i in range(1, y.shape[1] + 1)]
+            else:
+                raise ValueError("y must be a 1D or 2D array-like structure.")
 
         n_samples, n_features = X.shape
+        n_outputs = y.shape[1]
+
+        # Handle weights
+        if weights is None:
+            weights = np.ones(n_samples)
+        else:
+            weights = np.asarray(weights)
+            if weights.shape[0] != n_samples:
+                raise ValueError("Weights array must have the same length as the number of observations.")
+
+        # Validate tau
+        self._validate_tau()
 
         # Add intercept term by appending a column of ones to X
         X_augmented = np.hstack((np.ones((n_samples, 1)), X))
 
-        # Initialize storage for multiple quantiles
-        self.coef_ = {q: np.zeros(n_features) for q in self.tau}
-        self.intercept_ = {q: 0.0 for q in self.tau}
-        self.stderr_ = {q: np.zeros(n_features + 1) for q in self.tau}
-        self.tvalues_ = {q: np.zeros(n_features + 1) for q in self.tau}
-        self.pvalues_ = {q: np.zeros(n_features + 1) for q in self.tau}
-        self._is_fitted = {q: False for q in self.tau}
+        # Initialize storage for multiple quantiles and outputs
+        self.coef_ = {q: {output: np.zeros(n_features) for output in self.output_names_} for q in self.tau}
+        self.intercept_ = {q: {output: 0.0 for output in self.output_names_} for q in self.tau}
+        self.stderr_ = {q: {output: np.zeros(n_features + 1) for output in self.output_names_} for q in self.tau}
+        self.tvalues_ = {q: {output: np.zeros(n_features + 1) for output in self.output_names_} for q in self.tau}
+        self.pvalues_ = {q: {output: np.zeros(n_features + 1) for output in self.output_names_} for q in self.tau}
+        self._is_fitted = {q: {output: False for output in self.output_names_} for q in self.tau}
 
-        # Solve LP for all quantiles simultaneously with non-crossing constraints
+        # Solve LP for all quantiles and outputs simultaneously with non-crossing constraints
         coefficients = self._solve_multiple_lp(X_augmented, y, weights)
 
         # Extract the coefficients
         for q in self.tau:
-            self.intercept_[q] = coefficients[q][0]
-            self.coef_[q] = coefficients[q][1:]
+            for idx, output in enumerate(self.output_names_):
+                self.intercept_[q][output] = coefficients[q][idx][0]
+                self.coef_[q][output] = coefficients[q][idx][1:]
 
         # Compute standard errors via bootstrapping with progress indicators
         self._compute_standard_errors(X_augmented, y, weights)
 
-        # Mark all quantiles as fitted
+        # Mark all quantiles and outputs as fitted
         for q in self.tau:
-            self._is_fitted[q] = True
+            for output in self.output_names_:
+                self._is_fitted[q][output] = True
 
         return self
 
@@ -188,7 +213,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         X : ndarray of shape (n_samples, n_features + 1)
             Augmented feature matrix with intercept.
 
-        y : ndarray of shape (n_samples,)
+        y : ndarray of shape (n_samples, n_outputs)
             Target values.
 
         weights : ndarray of shape (n_samples,)
@@ -200,9 +225,11 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         Returns
         -------
         coefficients : dict (only if return_coefficients is True)
-            Estimated coefficients for each quantile.
+            Estimated coefficients for each quantile and output.
+            Structure: {tau: {output: array of coefficients}}
         """
-        n_samples, n_features = X.shape
+        n_samples, n_features_plus_1 = X.shape
+        n_outputs = y.shape[1]
         n_quantiles = len(self.tau)
 
         # Create the solver instance
@@ -212,50 +239,67 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
 
         infinity = solver.infinity()
 
-        # Define variables for each quantile
-        beta = {q: [solver.NumVar(-infinity, infinity, f'beta_{j}_q{q}') for j in range(n_features)] for q in self.tau}
-        r_pos = {q: [solver.NumVar(0, infinity, f'r_pos_{i}_q{q}') for i in range(n_samples)] for q in self.tau}
-        r_neg = {q: [solver.NumVar(0, infinity, f'r_neg_{i}_q{q}') for i in range(n_samples)] for q in self.tau}
+        # Define variables for each quantile and output
+        # Structure: beta[q][k][j], r_pos[q][k][i], r_neg[q][k][i]
+        beta = {q: {k: [solver.NumVar(-infinity, infinity, f'beta_{j}_q{q}_k{k}') 
+                       for j in range(n_features_plus_1)] for k in range(n_outputs)} 
+                for q in self.tau}
+        r_pos = {q: {k: [solver.NumVar(0, infinity, f'r_pos_{i}_q{q}_k{k}') 
+                         for i in range(n_samples)] for k in range(n_outputs)} 
+                  for q in self.tau}
+        r_neg = {q: {k: [solver.NumVar(0, infinity, f'r_neg_{i}_q{q}_k{k}') 
+                         for i in range(n_samples)] for k in range(n_outputs)} 
+                  for q in self.tau}
 
-        # If L1 regularization is specified, introduce auxiliary variables for each quantile and feature
+        # If L1 regularization is specified, introduce auxiliary variables for each quantile, output, and feature
         if self.regularization == 'l1' and self.alpha > 0:
-            z = {q: [solver.NumVar(0, infinity, f'z_{j}_q{q}') for j in range(1, n_features)] for q in self.tau}
+            z = {q: {k: [solver.NumVar(0, infinity, f'z_{j}_q{q}_k{k}') 
+                        for j in range(1, n_features_plus_1)] for k in range(n_outputs)} 
+                 for q in self.tau}
             for q in self.tau:
-                for j in range(1, n_features):
-                    # z_j_q >= beta_j_q
-                    solver.Add(beta[q][j] <= z[q][j - 1])
-                    # z_j_q >= -beta_j_q
-                    solver.Add(-beta[q][j] <= z[q][j - 1])
+                for k in range(n_outputs):
+                    for j in range(1, n_features_plus_1):
+                        # z_j_q_k >= beta_j_q_k
+                        solver.Add(beta[q][k][j] <= z[q][k][j - 1])
+                        # z_j_q_k >= -beta_j_q_k
+                        solver.Add(-beta[q][k][j] <= z[q][k][j - 1])
 
         # Add constraints and objective
         objective = solver.Objective()
         for q in self.tau:
-            for i in range(n_samples):
-                # Residual constraints: y_i = x_i^T beta_q + r_pos_q_i - r_neg_q_i
-                constraint_expr = sum(X[i, j] * beta[q][j] for j in range(n_features)) + r_pos[q][i] - r_neg[q][i]
-                solver.Add(constraint_expr == y[i])
+            for k in range(n_outputs):
+                for i in range(n_samples):
+                    # Residual constraints: y_i_k = x_i^T beta_q_k + r_pos_q_k_i - r_neg_q_k_i
+                    constraint_expr = (
+                        sum(X[i, j] * beta[q][k][j] for j in range(n_features_plus_1)) + 
+                        r_pos[q][k][i] - 
+                        r_neg[q][k][i]
+                    )
+                    solver.Add(constraint_expr == y[i, k])
 
-                # Objective coefficients
-                objective.SetCoefficient(r_pos[q][i], q * weights[i])
-                objective.SetCoefficient(r_neg[q][i], (1 - q) * weights[i])
+                    # Objective coefficients
+                    objective.SetCoefficient(r_pos[q][k][i], self.tau[self.tau.index(q)] * weights[i])
+                    objective.SetCoefficient(r_neg[q][k][i], (1 - self.tau[self.tau.index(q)]) * weights[i])
 
         # Add L1 regularization to the objective if specified
         if self.regularization == 'l1' and self.alpha > 0:
             for q in self.tau:
-                for j in range(n_features - 1):
-                    objective.SetCoefficient(z[q][j], self.alpha)
+                for k in range(n_outputs):
+                    for j in range(n_features_plus_1 - 1):
+                        objective.SetCoefficient(z[q][k][j], self.alpha)
 
         objective.SetMinimization()
 
-        # Add non-crossing constraints
-        for i in range(n_samples):
-            for k in range(n_quantiles - 1):
-                q_lower = self.tau[k]
-                q_upper = self.tau[k + 1]
-                # Predicted values for quantile q_lower <= predicted values for quantile q_upper
-                pred_lower = sum(X[i, j] * beta[q_lower][j] for j in range(n_features))
-                pred_upper = sum(X[i, j] * beta[q_upper][j] for j in range(n_features))
-                solver.Add(pred_lower <= pred_upper)
+        # Add non-crossing constraints per output
+        for k in range(n_outputs):
+            for i in range(n_samples):
+                for q_idx in range(len(self.tau) - 1):
+                    q_lower = self.tau[q_idx]
+                    q_upper = self.tau[q_idx + 1]
+                    # Predicted values for quantile q_lower <= predicted values for quantile q_upper
+                    pred_lower = sum(X[i, j] * beta[q_lower][k][j] for j in range(n_features_plus_1))
+                    pred_upper = sum(X[i, j] * beta[q_upper][k][j] for j in range(n_features_plus_1))
+                    solver.Add(pred_lower <= pred_upper)
 
         # Solve the LP problem
         status = solver.Solve()
@@ -267,9 +311,11 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
             # Extract the coefficients
             coefficients = {}
             for q in self.tau:
-                intercept = beta[q][0].solution_value()
-                coef = np.array([beta[q][j].solution_value() for j in range(1, n_features)])
-                coefficients[q] = np.concatenate(([intercept], coef))
+                coefficients[q] = {}
+                for k in range(n_outputs):
+                    intercept = beta[q][k][0].solution_value()
+                    coef = np.array([beta[q][k][j].solution_value() for j in range(1, n_features_plus_1)])
+                    coefficients[q][k] = np.concatenate(([intercept], coef))
             return coefficients
 
     def _compute_standard_errors(self, X, y, weights):
@@ -281,19 +327,20 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         X : ndarray of shape (n_samples, n_features + 1)
             Augmented feature matrix with intercept.
 
-        y : ndarray of shape (n_samples,)
+        y : ndarray of shape (n_samples, n_outputs)
             Target values.
 
         weights : ndarray of shape (n_samples,)
             Weights for each observation.
         """
         np.random.seed(self.random_state)
-        n_samples = X.shape[0]
-        n_features = X.shape[1]
+        n_samples, n_features_plus_1 = X.shape
+        n_outputs = y.shape[1]
         n_quantiles = len(self.tau)
 
         # Initialize storage for bootstrap coefficients
-        beta_bootstrap = {q: np.zeros((self.n_bootstrap, n_features)) for q in self.tau}
+        beta_bootstrap = {q: {output: np.zeros((self.n_bootstrap, n_features_plus_1)) 
+                             for output in self.output_names_} for q in self.tau}
 
         # Determine the number of jobs
         if self.n_jobs == -1:
@@ -315,7 +362,7 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
             y_sample = y[sample_indices]
             weights_sample = weights[sample_indices]
             try:
-                # Solve for multiple quantiles
+                # Solve for multiple quantiles and outputs
                 beta_sample = self._solve_multiple_lp(X_sample, y_sample, weights_sample, return_coefficients=True)
                 with lock:
                     counter.value += 1
@@ -323,7 +370,8 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
             except Exception:
                 with lock:
                     counter.value += 1
-                return {q: np.full(n_features, np.nan) for q in self.tau}
+                return {q: {output: np.full(n_features_plus_1, np.nan) for output in self.output_names_} 
+                        for q in self.tau}
 
         # Function to update the progress bar
         def update_pbar():
@@ -354,29 +402,31 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
         # Populate bootstrap coefficients
         for i, beta_sample in enumerate(results):
             for q in self.tau:
-                beta_bootstrap[q][i, :] = beta_sample[q]
+                for k, output in enumerate(self.output_names_):
+                    beta_bootstrap[q][output][i, :] = beta_sample[q][k]
 
-        # Compute standard errors, t-values, and p-values for each quantile
+        # Compute standard errors, t-values, and p-values for each quantile and output
         for q in self.tau:
-            # Remove any iterations where the solver failed
-            valid_bootstrap = beta_bootstrap[q][~np.isnan(beta_bootstrap[q]).any(axis=1)]
+            for output in self.output_names_:
+                # Remove any iterations where the solver failed
+                valid_bootstrap = beta_bootstrap[q][output][~np.isnan(beta_bootstrap[q][output]).any(axis=1)]
 
-            if valid_bootstrap.size == 0:
-                raise Exception(f"All bootstrap iterations failed for quantile {q}.")
+                if valid_bootstrap.size == 0:
+                    raise Exception(f"All bootstrap iterations failed for quantile {q} and output {output}.")
 
-            # Compute standard errors
-            stderr = np.std(valid_bootstrap, axis=0, ddof=1)
-            self.stderr_[q] = stderr
+                # Compute standard errors
+                stderr = np.std(valid_bootstrap, axis=0, ddof=1)
+                self.stderr_[q][output] = stderr
 
-            # Compute t-values and p-values
-            coef_full = np.concatenate(([self.intercept_[q]], self.coef_[q]))
-            stderr_full = self.stderr_[q]
-            tvalues_full = coef_full / stderr_full
-            self.tvalues_[q] = tvalues_full
+                # Compute t-values and p-values
+                coef_full = np.concatenate(([self.intercept_[q][output]], self.coef_[q][output]))
+                stderr_full = self.stderr_[q][output]
+                tvalues_full = coef_full / stderr_full
+                self.tvalues_[q][output] = tvalues_full
 
-            df = len(y) - (X.shape[1] - 1)  # Degrees of freedom
-            pvalues_full = 2 * (1 - t.cdf(np.abs(tvalues_full), df=df))
-            self.pvalues_[q] = pvalues_full
+                df = len(y) - (X.shape[1] - 1)  # Degrees of freedom
+                pvalues_full = 2 * (1 - t.cdf(np.abs(tvalues_full), df=df))
+                self.pvalues_[q][output] = pvalues_full
 
     def predict(self, X):
         """
@@ -389,10 +439,11 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
 
         Returns
         -------
-        y_pred : dict of ndarrays
-            Predicted values for each quantile. Keys are quantile values, and values are arrays of predictions.
+        y_pred : dict of dicts of ndarrays
+            Predicted values for each quantile and output.
+            Structure: {tau: {output: array of predictions}}
         """
-        if not all(self._is_fitted.values()):
+        if not all(all(fit for fit in self._is_fitted[q].values()) for q in self.tau):
             raise Exception("Model is not fitted yet. Please call 'fit' before 'predict'.")
 
         # Handle pandas DataFrames
@@ -408,7 +459,10 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
 
         y_pred = {}
         for q in self.tau:
-            y_pred[q] = X_augmented @ np.concatenate(([self.intercept_[q]], self.coef_[q]))
+            y_pred[q] = {}
+            for output in self.output_names_:
+                coefficients = np.concatenate(([self.intercept_[q][output]], self.coef_[q][output]))
+                y_pred[q][output] = X_augmented @ coefficients
         return y_pred
 
     def summary(self):
@@ -417,24 +471,26 @@ class QuantileRegression(BaseEstimator, RegressorMixin):
 
         Returns
         -------
-        summary_dict : dict of pandas DataFrames
-            Summary tables for each quantile with coefficients, standard errors, t-values, and p-values.
+        summary_dict : dict of dicts of pandas DataFrames
+            Summary tables for each quantile and output with coefficients, standard errors, t-values, and p-values.
+            Structure: {tau: {output: DataFrame}}
         """
-        if not all(self._is_fitted.values()):
+        if not all(all(fit for fit in self._is_fitted[q].values()) for q in self.tau):
             raise Exception("Model is not fitted yet. Please call 'fit' before 'summary'.")
 
         summary_dict = {}
         for q in self.tau:
-            coef = np.concatenate(([self.intercept_[q]], self.coef_[q]))
-            index = ['Intercept'] + self.feature_names_
-            summary_df = pd.DataFrame({
-                'Coefficient': coef,
-                'Std. Error': self.stderr_[q],
-                't-value': self.tvalues_[q],
-                'P>|t|': self.pvalues_[q],
-            }, index=index)
-            summary_dict[q] = summary_df
-
+            summary_dict[q] = {}
+            for output in self.output_names_:
+                coef = np.concatenate(([self.intercept_[q][output]], self.coef_[q][output]))
+                index = ['Intercept'] + self.feature_names_
+                summary_df = pd.DataFrame({
+                    'Coefficient': coef,
+                    'Std. Error': self.stderr_[q][output],
+                    't-value': self.tvalues_[q][output],
+                    'P>|t|': self.pvalues_[q][output],
+                }, index=index)
+                summary_dict[q][output] = summary_df
         return summary_dict
 
     def get_params(self, deep=True):
